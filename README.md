@@ -1,6 +1,6 @@
 # Firmware-Specialized LLM Serving Engine
 
-A from-scratch LLM inference engine, specialized for firmware/UEFI code, with custom low-power inference kernels — built as a systems ML portfolio project on an NVIDIA RTX PRO 6000 Blackwell Max-Q (96GB, 300W).
+A from-scratch LLM inference engine, specialized for firmware/UEFI code, with custom low-power inference kernels.
 
 ## Why this project
 
