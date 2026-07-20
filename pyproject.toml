@@ -1,0 +1,20 @@
+[project]
+name = "strata"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "vllm==0.25.1",
+]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu130"
+
+[tool.uv]
+# This project targets one machine (NVIDIA GB10, aarch64) — restrict resolution
+# to that platform so uv doesn't backtrack through x86_64-only wheels (e.g.
+# xformers) that don't exist for aarch64 and would otherwise break `uv add`.
+environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
+index-strategy = "unsafe-best-match"

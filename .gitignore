@@ -1,1 +1,20 @@
+docs/
+.claude/
 
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# Model weights / HF cache (never commit large binaries)
+models/
+*.safetensors
+*.gguf
+
+# Third-party sources built locally (llama.cpp, etc.) — reference only, not vendored
+third_party/
+
+# Benchmark artifacts that may include large logs (keep the curated write-up only)
+benchmarks/*.json
+benchmarks/*.log
+benchmarks/raw/

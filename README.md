@@ -14,7 +14,7 @@ The paged KV-cache work in particular is a direct application of OS virtual-memo
 
 ## Benchmarks
 
-*To be filled in starting at M0. Will track tokens/sec, time-to-first-token, inter-token latency, and memory utilization vs. vLLM/llama.cpp baselines, plus throughput vs. GPU power cap.*
+*To be filled in starting at M0. Will track tokens/sec, time-to-first-token, inter-token latency, and memory utilization vs. vLLM/llama.cpp baselines, plus tokens/sec/watt efficiency across engine design choices (the target hardware, an NVIDIA GB10, has no power-cap control, so power is measured rather than swept).*
 
 ## Getting started
 
