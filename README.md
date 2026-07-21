@@ -27,6 +27,23 @@ The paged KV-cache work in particular is a direct application of OS virtual-memo
   greedy decoding is deterministic and any mismatch means the manual KV-cache threading
   is wrong.
 
+**M2 (static batching)** adds to `strata/`:
+
+- `strata/model.py` — `build_batch_chat_prompt()`: left-pads a batch of chat-templated
+  prompts to the longest one (`tokenizer.padding_side = "left"`), so every sequence's
+  next-token position lands at the same trailing index across the batch.
+- `strata/engine.py` — `BatchEngine`: prefill and decode run as one shared `forward()`
+  call per step for the whole batch, using the standard HF left-padding recipe for
+  `attention_mask`/`position_ids`. Batch size is fixed for the call: a sequence that
+  hits EOS has its output frozen and is fed a pad token for the rest of the batch's
+  decode loop rather than being evicted — wasted compute on short sequences once
+  others are still running, which M3's continuous batching removes.
+- `scripts/run_m2.py` — CLI demo; pass `--prompt` multiple times to build a batch,
+  prints per-sequence output and which decode step each sequence finished at.
+- `tests/test_batch_prompt.py` / `tests/test_m2_correctness.py` — padding-shape check
+  and the correctness gate (token-for-token match against HF's batched
+  `model.generate()`), same pattern as M1's test.
+
 Block manager and scheduler land in M3/M4 as batching is introduced.
 
 ## Benchmarks
@@ -37,6 +54,11 @@ matching the M0 vLLM concurrency-1 baseline of 13.61 tok/s — expected, since a
 unbatched request is the one case where the naive loop isn't leaving batching
 throughput on the table. Full benchmark comparisons resume at M5 once continuous
 batching (M3) and paged KV (M4) are in place.
+
+M2's static-batching engine measured **22.96** aggregate decode tok/s on a 2-prompt
+batch (short + long prompt mixed deliberately), TTFT **545.9** ms; sequence 0 finished
+at decode step 63 while the batch kept running 127 steps total for the still-active
+sequence — the wasted compute M3 (continuous batching) is designed to remove.
 
 ## Getting started
 
