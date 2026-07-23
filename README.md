@@ -44,7 +44,28 @@ The paged KV-cache work in particular is a direct application of OS virtual-memo
   and the correctness gate (token-for-token match against HF's batched
   `model.generate()`), same pattern as M1's test.
 
-Block manager and scheduler land in M3/M4 as batching is introduced.
+**M3 (continuous batching)** adds to `strata/`:
+
+- `strata/kv_cache.py` — `pad_and_batch_caches()` / `split_batched_cache()`: since
+  batch membership changes every decode step (sequences finish and get evicted, new
+  ones get admitted from a queue), each active sequence keeps its own unpadded
+  per-layer KV cache; every step, the active set is left-padded into one shared
+  batch for `forward()`, then split back into unpadded per-sequence caches for the
+  next step, whose active set may differ again.
+- `strata/engine.py` — `ContinuousBatchEngine`: evicts a sequence the instant it
+  finishes (EOS or its own `max_new_tokens` budget) and admits the next queued
+  prompt into the freed slot via its own single-sequence prefill call, rather than
+  waiting for the whole batch to drain like M2. `max_concurrent_slots` caps how many
+  sequences run at once; the rest wait in a queue.
+- `scripts/run_m3.py` — CLI demo; pass `--prompt` multiple times and
+  `--max-concurrent-slots` to force queueing, prints per-sequence output plus which
+  global step each sequence was admitted/finished at.
+- `tests/test_kv_cache_repack.py` — fast, non-GPU tests for the pad/split repacking
+  using synthetic tensors. `tests/test_m3_correctness.py` — the correctness gate:
+  each sequence's output must match its own standalone HF `.generate()`, and asserts
+  the scheduler actually queued something (not a degenerate static batch).
+
+Paged KV cache (block-based memory management) lands in M4.
 
 ## Benchmarks
 
@@ -59,6 +80,12 @@ M2's static-batching engine measured **22.96** aggregate decode tok/s on a 2-pro
 batch (short + long prompt mixed deliberately), TTFT **545.9** ms; sequence 0 finished
 at decode step 63 while the batch kept running 127 steps total for the still-active
 sequence — the wasted compute M3 (continuous batching) is designed to remove.
+
+M3's continuous-batching engine measured **23.39** aggregate decode tok/s across
+the same 2 prompts as M2 plus a third, with `max_concurrent_slots=2` forcing the
+third prompt to queue — it was admitted at global step **63**, as soon
+as a slot freed, rather than waiting for the whole batch to drain. Total wall clock:
+**9.448**s.
 
 ## Getting started
 
