@@ -1,4 +1,4 @@
-"""M1/M2: naive single-request engine and static-batching engine.
+"""M1/M2/M3: naive single-request, static-batching, and continuous-batching engines.
 
 Manual prefill + decode loop with a manually-threaded KV cache (transformers'
 DynamicCache — one growing [batch, kv_heads, seq, head_dim] tensor per layer).
@@ -7,6 +7,11 @@ NaiveEngine (M1) handles a single sequence at a time, built for correctness
 and to see the tensor shapes at each step, not for performance. BatchEngine
 (M2) batches N sequences with left-padding and a fixed-size static batch —
 no scheduler, no mid-batch eviction (see BatchEngine's docstring).
+ContinuousBatchEngine (M3) adds iteration-level scheduling: a sequence is
+evicted the instant it finishes and the next queued sequence is admitted
+into the freed slot, without waiting for the rest of the batch to drain
+(see ContinuousBatchEngine's docstring, and strata/kv_cache.py for the
+per-step pad/split repacking this requires).
 """
 
 import time
@@ -374,7 +379,12 @@ class ContinuousBatchEngine:
                 # reaching max_new_tokens - 1 means this iteration's token
                 # is the last one allowed.
                 hit_budget = seq.local_step >= max_new_tokens - 1
-                if not is_eos:
+                # The decode loop always runs at least one iteration once a
+                # sequence is active, even when max_new_tokens == 1 (where
+                # decode shouldn't contribute any tokens at all). Gate the
+                # append on the same budget so that edge case still yields
+                # exactly max_new_tokens tokens total instead of max_new_tokens + 1.
+                if not is_eos and seq.local_step < max_new_tokens:
                     token_ids[seq.seq_id].append(tok)
                 if is_eos or hit_budget:
                     finished_at_step[seq.seq_id] = seq.local_step

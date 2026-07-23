@@ -85,7 +85,10 @@ M3's continuous-batching engine measured **23.39** aggregate decode tok/s across
 the same 2 prompts as M2 plus a third, with `max_concurrent_slots=2` forcing the
 third prompt to queue — it was admitted at global step **63**, as soon
 as a slot freed, rather than waiting for the whole batch to drain. Total wall clock:
-**9.448**s.
+**9.448**s. Note this figure isn't strictly like-for-like with M2's: M3's wall clock
+includes each sequence's individual prefill/admission time, while M2's aggregate
+tok/s is computed over its decode-only window — a byproduct of continuous batching
+having no single decode-only phase once admissions are interleaved throughout.
 
 ## Getting started
 
