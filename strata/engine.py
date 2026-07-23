@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from strata.kv_cache import pad_and_batch_caches, split_batched_cache
+
 
 @dataclass
 class GenerationResult:
@@ -244,4 +246,160 @@ class BatchEngine:
             finished_at_step=finished_at_step,
             total_decode_steps=total_decode_steps,
             prefill_shapes=prefill_shapes,
+        )
+
+
+@dataclass
+class ContinuousBatchGenerationResult:
+    token_ids: list[list[int]]
+    texts: list[str]
+    finished_at_step: list[int]
+    admitted_at_step: list[int]
+    total_global_steps: int
+    wall_clock_s: float
+    decode_tok_per_s: float
+
+
+@dataclass
+class _ActiveSequence:
+    seq_id: int
+    cache: list[tuple[torch.Tensor, torch.Tensor]]
+    next_token: torch.Tensor
+    admitted_at_step: int
+    local_step: int = 0
+
+
+class ContinuousBatchEngine:
+    """Iteration-level scheduling: evicts a sequence the moment it finishes
+    and admits the next queued sequence into the freed slot, without
+    waiting for the whole batch to drain (unlike BatchEngine/M2, where
+    batch membership is fixed for the whole call). Every decode step,
+    the currently-active sequences' individually-shaped KV caches are
+    left-padded into one shared forward() call via strata.kv_cache, then
+    split back into unpadded per-sequence caches for the next step.
+    """
+
+    def __init__(self, model, tokenizer, verbose: bool = False):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.verbose = verbose
+
+    def _prefill(self, prompt_input_ids: torch.Tensor):
+        out = self.model(prompt_input_ids, use_cache=True)
+        cache = out.past_key_values
+        num_layers = len(cache.layers)
+        seq_cache = [(cache.layers[l].keys, cache.layers[l].values) for l in range(num_layers)]
+        logits = out.logits[:, -1, :]
+        next_token = logits.argmax(dim=-1, keepdim=True)
+        return seq_cache, next_token
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt_input_ids: list[torch.Tensor],
+        max_concurrent_slots: int,
+        max_new_tokens: int = 256,
+    ) -> ContinuousBatchGenerationResult:
+        device = next(self.model.parameters()).device
+        eos_token_id = self.tokenizer.eos_token_id
+        n = len(prompt_input_ids)
+
+        queue = list(range(n))
+        token_ids: list[list[int]] = [[] for _ in range(n)]
+        finished_at_step = [-1] * n
+        admitted_at_step = [-1] * n
+        active: list[_ActiveSequence] = []
+        global_step = 0
+
+        def admit(seq_id: int, step: int) -> _ActiveSequence | None:
+            ids = prompt_input_ids[seq_id].to(device)
+            seq_cache, next_token = self._prefill(ids)
+            admitted_at_step[seq_id] = step
+            tok = next_token.item()
+            if tok == eos_token_id:
+                finished_at_step[seq_id] = 0
+                return None
+            token_ids[seq_id].append(tok)
+            return _ActiveSequence(
+                seq_id=seq_id, cache=seq_cache, next_token=next_token, admitted_at_step=step
+            )
+
+        t0 = time.perf_counter()
+
+        while queue and len(active) < max_concurrent_slots:
+            seq = admit(queue.pop(0), global_step)
+            if seq is not None:
+                active.append(seq)
+
+        while active:
+            batch_caches = [seq.cache for seq in active]
+            batched_cache, attention_mask, position_ids = pad_and_batch_caches(batch_caches)
+            step_attention_mask = torch.cat(
+                [attention_mask, torch.ones(len(active), 1, dtype=attention_mask.dtype, device=device)],
+                dim=-1,
+            )
+            step_input = torch.cat([seq.next_token for seq in active], dim=0)
+
+            out = self.model(
+                step_input,
+                attention_mask=step_attention_mask,
+                position_ids=position_ids,
+                past_key_values=batched_cache,
+                use_cache=True,
+            )
+            logits = out.logits[:, -1, :]
+            next_ids = logits.argmax(dim=-1, keepdim=True)
+            split_caches = split_batched_cache(out.past_key_values, step_attention_mask)
+
+            global_step += 1
+            if self.verbose and global_step == 1:
+                print(
+                    f"[global step {global_step}] active={len(active)} "
+                    f"step_input={tuple(step_input.shape)} "
+                    f"kv_cache[0]={tuple(batched_cache.layers[0].keys.shape)}"
+                )
+
+            still_active = []
+            for i, seq in enumerate(active):
+                seq.cache = split_caches[i]
+                seq.next_token = next_ids[i : i + 1]
+                seq.local_step += 1
+                tok = next_ids[i, 0].item()
+                is_eos = tok == eos_token_id
+                # Prefill already contributed 1 token (in admit()), so the
+                # decode loop may only contribute max_new_tokens - 1 more to
+                # keep the per-sequence total at max_new_tokens (same
+                # convention as NaiveEngine's `range(max_new_tokens - 1)`
+                # and BatchEngine's `range(1, max_new_tokens)`). local_step
+                # reaching max_new_tokens - 1 means this iteration's token
+                # is the last one allowed.
+                hit_budget = seq.local_step >= max_new_tokens - 1
+                if not is_eos:
+                    token_ids[seq.seq_id].append(tok)
+                if is_eos or hit_budget:
+                    finished_at_step[seq.seq_id] = seq.local_step
+                else:
+                    still_active.append(seq)
+            active = still_active
+
+            while queue and len(active) < max_concurrent_slots:
+                seq = admit(queue.pop(0), global_step)
+                if seq is not None:
+                    active.append(seq)
+
+        wall_clock_s = time.perf_counter() - t0
+        total_tokens = sum(max(len(g) - 1, 0) for g in token_ids)
+        decode_tok_per_s = (
+            total_tokens / wall_clock_s if wall_clock_s > 0 and total_tokens > 0 else 0.0
+        )
+
+        texts = [self.tokenizer.decode(g, skip_special_tokens=True) for g in token_ids]
+        return ContinuousBatchGenerationResult(
+            token_ids=token_ids,
+            texts=texts,
+            finished_at_step=finished_at_step,
+            admitted_at_step=admitted_at_step,
+            total_global_steps=global_step,
+            wall_clock_s=wall_clock_s,
+            decode_tok_per_s=decode_tok_per_s,
         )
