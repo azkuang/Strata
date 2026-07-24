@@ -65,7 +65,43 @@ The paged KV-cache work in particular is a direct application of OS virtual-memo
   each sequence's output must match its own standalone HF `.generate()`, and asserts
   the scheduler actually queued something (not a degenerate static batch).
 
-Paged KV cache (block-based memory management) lands in M4.
+**M4 (paged KV cache)** adds to `strata/`:
+
+- `strata/block_allocator.py` — `BlockAllocator`: a free list of physical
+  block indices plus the KV pool itself (one preallocated
+  `[num_blocks, kv_heads, block_size, head_dim]` tensor per layer, per K/V).
+  `alloc()`/`free()` manage the free list; exhaustion returns `None`
+  rather than raising, since running out of blocks is normal backpressure.
+- `strata/paged_kv_cache.py` — `SequenceBlockTable` (a sequence's ordered
+  list of physical block indices) plus `gather_and_batch()` /
+  `scatter_new_token()`: gather reconstructs each active sequence's tokens
+  from its blocks and left-pads/batches across the active set (same shape
+  contract as M3's `pad_and_batch_caches`, so `forward()` itself doesn't
+  change); scatter writes only the newly-computed token into the pool —
+  unlike M3, old tokens are never rewritten every step.
+- `strata/engine.py` — `PagedContinuousBatchEngine`: the same admit/evict/
+  queue scheduling as `ContinuousBatchEngine` (M3), but admission
+  allocates `ceil(prompt_len / block_size)` blocks up front, and a
+  sequence can be held in the queue by block-pool pressure, not just by
+  `max_concurrent_slots`. If the pool can't cover every already-active
+  sequence that needs a fresh block in the same step, one is preempted
+  (recompute-based: its progress is discarded and it re-prefills later)
+  rather than letting everyone wait, which could deadlock.
+- `scripts/run_m4.py` — CLI demo; adds `--num-blocks`/`--block-size` on
+  top of M3's args, sized to force visible block-pressure queuing.
+- `tests/test_block_allocator.py` / `tests/test_paged_kv_cache.py` — fast,
+  non-GPU tests for the allocator's free-list bookkeeping and the
+  gather/scatter round trip. `tests/test_m4_correctness.py` — the
+  correctness gate: each sequence's output must match its own standalone
+  HF `.generate()`, with the block pool deliberately sized so at least one
+  sequence is held back by block pressure specifically (not just the
+  slot-limit queuing M3's test already covers).
+
+**Scope note:** HF's stock `forward()` needs each layer's KV cache as one
+contiguous tensor, so M4 still gathers blocks into a contiguous scratch
+tensor before every `forward()` call — it builds the memory-management
+half of paged attention (block allocator, block table, free list), not a
+custom kernel that reads pages directly. That's Phase 3's job.
 
 ## Benchmarks
 
@@ -89,6 +125,23 @@ as a slot freed, rather than waiting for the whole batch to drain. Total wall cl
 includes each sequence's individual prefill/admission time, while M2's aggregate
 tok/s is computed over its decode-only window — a byproduct of continuous batching
 having no single decode-only phase once admissions are interleaved throughout.
+
+M4's paged-KV-cache engine measured **8.57** aggregate decode tok/s on the
+same 3 prompts as M3, with a block pool sized to `14` blocks (block_size
+16) and `max_concurrent_slots=3` (i.e. no slot-count limit) — small enough
+that sequence 1 was held back by block pressure alone, preempted shortly
+after its initial admission and re-admitted at global step **25** once
+enough blocks freed up. Total wall clock: **25.782**s over 152 global
+steps (vs. 127 for the same prompts under M3, since the preempted
+sequence's discarded progress must be recomputed from prefill once
+re-admitted — the throughput cost of choosing recompute-based preemption
+over reserving each sequence's full worst-case budget upfront, which would
+avoid this cost but reintroduce the reserve-for-worst-case memory waste
+paged attention exists to eliminate). All 3 sequences' final generated
+text is identical to M3's output regardless of preemption, confirming
+paging/scheduling changes don't affect correctness — only which physical
+blocks and how much recomputation a sequence's tokens pass through on the
+way there.
 
 ## Getting started
 
