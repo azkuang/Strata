@@ -40,6 +40,14 @@ def test_free_returns_blocks_to_the_free_list_for_reuse():
     assert sorted(reallocated) == sorted(block_ids)
 
 
+def test_alloc_with_zero_returns_empty_list_without_consuming_blocks():
+    allocator = _make_allocator(num_blocks=4)
+    initial_free = allocator.num_free()
+    result = allocator.alloc(0)
+    assert result == []
+    assert allocator.num_free() == initial_free
+
+
 def test_pool_tensors_have_expected_shape():
     allocator = BlockAllocator(
         num_blocks=5, num_layers=3, kv_heads=2, head_dim=4, block_size=16, device="cpu"

@@ -41,6 +41,8 @@ class BlockAllocator:
         """Pop `n` free block indices, or return None if fewer than `n`
         are free. All-or-nothing: never allocates a partial set.
         """
+        if n == 0:
+            return []
         if n > len(self.free_blocks):
             return None
         allocated = self.free_blocks[-n:]
