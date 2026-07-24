@@ -1,4 +1,5 @@
-"""M1/M2/M3: naive single-request, static-batching, and continuous-batching engines.
+"""M1/M2/M3/M4: naive single-request, static-batching, continuous-batching,
+and paged-KV-cache engines.
 
 Manual prefill + decode loop with a manually-threaded KV cache (transformers'
 DynamicCache — one growing [batch, kv_heads, seq, head_dim] tensor per layer).
@@ -12,6 +13,16 @@ evicted the instant it finishes and the next queued sequence is admitted
 into the freed slot, without waiting for the rest of the batch to drain
 (see ContinuousBatchEngine's docstring, and strata/kv_cache.py for the
 per-step pad/split repacking this requires).
+
+PagedContinuousBatchEngine (M4) replaces ContinuousBatchEngine's per-step
+pad/split repack with a fixed-size block pool (BlockAllocator) and
+per-sequence block table: gather reconstructs each active sequence's
+tokens from its blocks for the shared forward() call, and scatter writes
+only the newly-computed token back -- old tokens are never rewritten (see
+strata/paged_kv_cache.py and strata/block_allocator.py). When the pool
+can't cover every active sequence that needs a fresh block in the same
+step, one is preempted (its progress discarded, requeued to re-prefill
+later) rather than letting everyone wait, which could deadlock.
 """
 
 import time
@@ -20,6 +31,14 @@ from dataclasses import dataclass, field
 import torch
 
 from strata.kv_cache import pad_and_batch_caches, split_batched_cache
+from strata.block_allocator import BlockAllocator
+from strata.paged_kv_cache import (
+    SequenceBlockTable,
+    alloc_blocks_for_length,
+    gather_and_batch,
+    scatter_new_token,
+    write_prefill_tokens,
+)
 
 
 @dataclass
@@ -396,6 +415,266 @@ class ContinuousBatchEngine:
                 seq = admit(queue.pop(0), global_step)
                 if seq is not None:
                     active.append(seq)
+
+        wall_clock_s = time.perf_counter() - t0
+        total_tokens = sum(max(len(g) - 1, 0) for g in token_ids)
+        decode_tok_per_s = (
+            total_tokens / wall_clock_s if wall_clock_s > 0 and total_tokens > 0 else 0.0
+        )
+
+        texts = [self.tokenizer.decode(g, skip_special_tokens=True) for g in token_ids]
+        return ContinuousBatchGenerationResult(
+            token_ids=token_ids,
+            texts=texts,
+            finished_at_step=finished_at_step,
+            admitted_at_step=admitted_at_step,
+            total_global_steps=global_step,
+            wall_clock_s=wall_clock_s,
+            decode_tok_per_s=decode_tok_per_s,
+        )
+
+
+@dataclass
+class _PagedActiveSequence:
+    seq_id: int
+    table: SequenceBlockTable
+    next_token: torch.Tensor
+    admitted_at_step: int
+    local_step: int = 0
+
+
+class PagedContinuousBatchEngine:
+    """Same iteration-level scheduling as ContinuousBatchEngine (M3): evict
+    a sequence the instant it finishes, admit the next queued prompt into
+    the freed slot without waiting for the whole batch to drain. Unlike
+    M3, KV storage is a fixed-size block pool (BlockAllocator) instead of
+    each sequence owning its own growing tensor: every decode step gathers
+    each active sequence's tokens from its blocks (gather_and_batch), runs
+    the unmodified HF forward(), then scatters only the new token into the
+    pool (scatter_new_token) -- old tokens are never rewritten, unlike
+    M3's pad_and_batch_caches/split_batched_cache round trip.
+
+    Admission allocates ceil(prompt_len / block_size) blocks up front; if
+    the pool doesn't have enough free blocks for the queue's next prompt,
+    it simply stays queued and is retried next global step -- no progress
+    to lose there. An *active* sequence needing a fresh block mid-decode is
+    different: if every active sequence simply waited whenever blocks ran
+    short, multiple sequences landing on a block boundary at once with an
+    empty pool would deadlock (nobody advances, so nobody ever finishes to
+    free blocks). Instead each decode step resolves block pressure by
+    recompute-based preemption: evict another active sequence (preferring
+    one that doesn't itself need a block this step), freeing all its
+    blocks, discarding its progress, and returning it to the front of the
+    queue to re-prefill later -- vLLM's actual default policy under memory
+    pressure. See docs/superpowers/specs/2026-07-24-m4-paged-kv-cache-design.md
+    for why this was chosen over simply reserving each sequence's full
+    prompt+max_new_tokens budget upfront (that alternative avoids the
+    deadlock too, but reintroduces the reserve-for-worst-case memory waste
+    paged attention exists to eliminate).
+    """
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        num_blocks: int,
+        block_size: int = 16,
+        verbose: bool = False,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.verbose = verbose
+        config = model.config
+        num_layers = config.num_hidden_layers
+        kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        device = next(model.parameters()).device
+        self.allocator = BlockAllocator(
+            num_blocks=num_blocks,
+            num_layers=num_layers,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            dtype=next(model.parameters()).dtype,
+            device=device,
+        )
+
+    def _prefill(self, prompt_input_ids: torch.Tensor):
+        out = self.model(prompt_input_ids, use_cache=True)
+        num_layers = len(out.past_key_values.layers)
+        keys = [out.past_key_values.layers[l].keys for l in range(num_layers)]
+        values = [out.past_key_values.layers[l].values for l in range(num_layers)]
+        logits = out.logits[:, -1, :]
+        next_token = logits.argmax(dim=-1, keepdim=True)
+        return keys, values, next_token
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt_input_ids: list[torch.Tensor],
+        max_concurrent_slots: int,
+        max_new_tokens: int = 256,
+    ) -> ContinuousBatchGenerationResult:
+        device = next(self.model.parameters()).device
+        eos_token_id = self.tokenizer.eos_token_id
+        n = len(prompt_input_ids)
+        block_size = self.allocator.block_size
+
+        for ids in prompt_input_ids:
+            prompt_len = ids.shape[-1]
+            num_blocks_needed = (prompt_len + block_size - 1) // block_size
+            if num_blocks_needed > self.allocator.num_blocks:
+                raise RuntimeError(
+                    f"prompt of length {prompt_len} needs {num_blocks_needed} blocks, "
+                    f"more than the pool's total {self.allocator.num_blocks}"
+                )
+
+        queue = list(range(n))
+        token_ids: list[list[int]] = [[] for _ in range(n)]
+        finished_at_step = [-1] * n
+        admitted_at_step = [-1] * n
+        active: list[_PagedActiveSequence] = []
+        global_step = 0
+
+        def admit(seq_id: int, step: int) -> _PagedActiveSequence | None:
+            ids = prompt_input_ids[seq_id].to(device)
+            block_ids = alloc_blocks_for_length(self.allocator, ids.shape[-1])
+            table = SequenceBlockTable(block_ids=block_ids)
+            keys, values, next_token = self._prefill(ids)
+            write_prefill_tokens(self.allocator, table, keys, values)
+            admitted_at_step[seq_id] = step
+            tok = next_token.item()
+            if tok == eos_token_id:
+                finished_at_step[seq_id] = 0
+                self.allocator.free(table.block_ids)
+                return None
+            token_ids[seq_id].append(tok)
+            return _PagedActiveSequence(
+                seq_id=seq_id, table=table, next_token=next_token, admitted_at_step=step
+            )
+
+        def try_admit(step: int) -> None:
+            # Peek before popping: if the front of the queue needs more
+            # blocks than are currently free, break rather than pop, so it
+            # stays queued and gets retried next global step once
+            # something frees up. When `active` is empty this can only
+            # succeed (num_free() == num_blocks then, and every prompt was
+            # validated above to fit within the whole pool), so this never
+            # stalls with sequences permanently stuck behind an empty
+            # active set.
+            while queue and len(active) < max_concurrent_slots:
+                seq_id = queue[0]
+                prompt_len = prompt_input_ids[seq_id].shape[-1]
+                num_blocks_needed = (prompt_len + block_size - 1) // block_size
+                if num_blocks_needed > self.allocator.num_free():
+                    break
+                queue.pop(0)
+                seq = admit(seq_id, step)
+                if seq is not None:
+                    active.append(seq)
+
+        t0 = time.perf_counter()
+        try_admit(global_step)
+
+        while active:
+            step_active = list(active)  # stable snapshot: next_ids' row i is step_active[i]
+            tables = [seq.table for seq in step_active]
+            batched_cache, attention_mask, position_ids = gather_and_batch(self.allocator, tables)
+            step_attention_mask = torch.cat(
+                [attention_mask, torch.ones(len(step_active), 1, dtype=attention_mask.dtype, device=device)],
+                dim=-1,
+            )
+            step_input = torch.cat([seq.next_token for seq in step_active], dim=0)
+
+            out = self.model(
+                step_input,
+                attention_mask=step_attention_mask,
+                position_ids=position_ids,
+                past_key_values=batched_cache,
+                use_cache=True,
+            )
+            logits = out.logits[:, -1, :]
+            next_ids = logits.argmax(dim=-1, keepdim=True)
+
+            num_layers = len(out.past_key_values.layers)
+            new_keys = [out.past_key_values.layers[l].keys[:, :, -1:, :] for l in range(num_layers)]
+            new_values = [out.past_key_values.layers[l].values[:, :, -1:, :] for l in range(num_layers)]
+
+            # Resolve block pressure before scattering: figure out which
+            # sequences need a fresh block this step (their length lands
+            # exactly on a block boundary -- the same condition
+            # scatter_new_token checks internally). If the pool can't
+            # cover all of them, preempt other active sequences one at a
+            # time -- preferring ones that don't themselves need a block
+            # this step, since freeing those costs nothing extra -- until
+            # it can. `would_be_free` tracks the free-block count as if
+            # each preemption-so-far had already happened (freeing a
+            # sequence returns *all* its blocks, not just one, so this
+            # usually resolves in a single preemption).
+            needs_block = {
+                seq.seq_id for seq in step_active if seq.table.length % block_size == 0
+            }
+            preempted: set[int] = set()
+            would_be_free = self.allocator.num_free()
+            while len(needs_block - preempted) > would_be_free:
+                candidates = [s for s in step_active if s.seq_id not in preempted]
+                if len(candidates) <= 1:
+                    raise RuntimeError(
+                        f"pool of {self.allocator.num_blocks} blocks (block_size="
+                        f"{block_size}) cannot fit even a single sequence's growth "
+                        "-- increase num_blocks"
+                    )
+                non_growth = [s for s in candidates if s.seq_id not in needs_block]
+                victim = non_growth[-1] if non_growth else candidates[-1]
+                preempted.add(victim.seq_id)
+                would_be_free += len(victim.table.block_ids)
+
+            for seq in step_active:
+                if seq.seq_id in preempted:
+                    self.allocator.free(seq.table.block_ids)
+                    token_ids[seq.seq_id] = []
+                    admitted_at_step[seq.seq_id] = -1
+                    queue.insert(0, seq.seq_id)
+
+            global_step += 1
+            if self.verbose and global_step == 1:
+                print(
+                    f"[global step {global_step}] active={len(step_active)} "
+                    f"step_input={tuple(step_input.shape)} "
+                    f"kv_pool_free={self.allocator.num_free()}/{self.allocator.num_blocks}"
+                )
+
+            still_active = []
+            for i, seq in enumerate(step_active):
+                if seq.seq_id in preempted:
+                    continue  # already freed/re-queued above; discard this step's token
+                seq.next_token = next_ids[i : i + 1]
+                seq.local_step += 1
+                tok = next_ids[i, 0].item()
+                is_eos = tok == eos_token_id
+                # Same max_new_tokens accounting convention as
+                # ContinuousBatchEngine (M3) -- see its fix for the
+                # max_new_tokens=1 edge case.
+                hit_budget = seq.local_step >= max_new_tokens - 1
+                if not is_eos and seq.local_step < max_new_tokens:
+                    token_ids[seq.seq_id].append(tok)
+                # Guaranteed to succeed: the preemption pass above ensured
+                # enough free blocks exist for every surviving sequence
+                # that needs one this step.
+                scatter_new_token(
+                    self.allocator,
+                    [seq.table],
+                    [k[i : i + 1] for k in new_keys],
+                    [v[i : i + 1] for v in new_values],
+                )
+                if is_eos or hit_budget:
+                    finished_at_step[seq.seq_id] = seq.local_step
+                    self.allocator.free(seq.table.block_ids)
+                else:
+                    still_active.append(seq)
+            active[:] = still_active
+
+            try_admit(global_step)
 
         wall_clock_s = time.perf_counter() - t0
         total_tokens = sum(max(len(g) - 1, 0) for g in token_ids)
