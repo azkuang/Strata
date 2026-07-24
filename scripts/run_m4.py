@@ -6,12 +6,14 @@ pressure (not just max_concurrent_slots, M3's queuing mechanism) -- pass
 it happen.
 
 Example (same 3 prompts as M3's demo, with a small pool to force block
-pressure as well as slot-limit queuing):
+pressure via preemption -- max_concurrent_slots=3 admits all 3 immediately,
+so any admission after step 0 proves the pool, not slot limits, held a
+sequence back):
     uv run python scripts/run_m4.py \
         --prompt "Write a one-sentence description of a binary search tree." \
         --prompt "Write a detailed, at-least-five-sentence explanation of how a hash table resolves collisions using open addressing." \
         --prompt "Write a one-sentence description of a linked list." \
-        --max-concurrent-slots 3 --num-blocks 20 --max-new-tokens 128 --verbose
+        --max-concurrent-slots 3 --num-blocks 14 --max-new-tokens 128 --verbose
 """
 
 import argparse
