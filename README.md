@@ -161,13 +161,14 @@ through, and everything above it is bookkeeping the engine added.
 M2 also reproduced the M0 batching-efficiency curve from first
 principles: **15.6x tokens/sec/watt** from concurrency 1 to 32 at a 1.41x
 power cost, against vLLM's 21.2x at 1.46x. Two predictions were refuted
-by the data and are documented as such: M4's peak allocation does *not*
-flatten across concurrency (it grows +0.543 GB from c=1 to c=32, the same
-slope as M3's +0.542 GB, while sitting exactly 3.67 GB higher for the
-4000-block pool), because HF's contiguous-`forward()` requirement means
-M4 still materializes M3's padded scratch tensor every step — paging's
-memory win can't be collected until a kernel reads pages in place, which
-is Phase 3's job.
+by the data and are documented as such: the expected M2 < M3 < M4
+throughput ordering did not hold, for the harness reason above, and M4's
+peak allocation does *not* flatten across concurrency (it grows +0.543 GB
+from c=1 to c=32, the same slope as M3's +0.542 GB, while sitting exactly
+3.67 GB higher for the 4000-block pool), because HF's contiguous-`forward()`
+requirement means M4 still materializes M3's padded scratch tensor every
+step — paging's memory win can't be collected until a kernel reads pages
+in place, which is Phase 3's job.
 
 ## Getting started
 

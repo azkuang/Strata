@@ -10,6 +10,7 @@ one JSONL file.
 import argparse
 import subprocess
 import sys
+from pathlib import Path
 
 ENGINES = ["m2", "m3", "m4"]
 CONCURRENCIES = [1, 8, 32]
@@ -26,6 +27,17 @@ def main() -> None:
         help="m4 pool size; generous enough to avoid preemption at concurrency<=32 (see plan's Global Constraints sizing note)",
     )
     args = parser.parse_args()
+
+    if Path(args.output).exists():
+        print(
+            f"error: --output path already exists: {args.output}\n"
+            "scripts/benchmark_m5.py appends to this file, so re-running the "
+            "suite against an existing file would interleave a second run's "
+            "rows with the first. Delete/rename the existing file or pass a "
+            "different --output path.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     for engine in ENGINES:
         for concurrency in CONCURRENCIES:
