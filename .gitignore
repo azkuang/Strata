@@ -17,4 +17,7 @@ third_party/
 # Benchmark artifacts that may include large logs (keep the curated write-up only)
 benchmarks/*.json
 benchmarks/*.log
-benchmarks/raw/
+benchmarks/raw/*
+# ...except M5's grid results: 9 small JSONL rows, cited by name in README.md
+# and benchmarks/m5_report.md, so the write-up's numbers stay traceable.
+!benchmarks/raw/m5_results.jsonl

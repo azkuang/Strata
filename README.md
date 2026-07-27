@@ -143,6 +143,33 @@ paging/scheduling changes don't affect correctness — only which physical
 blocks and how much recomputation a sequence's tokens pass through on the
 way there.
 
+**M5** ran the full M2/M3/M4 x concurrency-{1,8,32} grid
+(`scripts/run_m5_suite.py`) against the same M0 baseline. Full
+throughput/latency/memory/efficiency comparison and design rationale:
+`benchmarks/m5_report.md`; raw rows in `benchmarks/raw/m5_results.jsonl`.
+Headline: **M2's static batching reached 251.34 uniform tok/s at
+concurrency 32 — 59.2% of the M0 vLLM bf16 baseline's 424.23 tok/s — and
+beat both M3 (198.42) and M4 (160.45) on this workload.** That inversion
+is the report's main finding, and it's a property of the benchmark rather
+than a defect in M3/M4: the harness sets `max_concurrent_slots` equal to
+the request count, so the queue is never non-empty and continuous
+batching has nothing to schedule, while still paying its full per-step KV
+repack cost. The cost is directly visible in per-global-step time from
+concurrency 1 to 32: **+8.7% for M2, +35.3% for M3, +63.1% for M4** —
+M2's near-flat curve is the machine's bandwidth-bound decode showing
+through, and everything above it is bookkeeping the engine added.
+M2 also reproduced the M0 batching-efficiency curve from first
+principles: **15.6x tokens/sec/watt** from concurrency 1 to 32 at a 1.41x
+power cost, against vLLM's 21.2x at 1.46x. Two predictions were refuted
+by the data and are documented as such: the expected M2 < M3 < M4
+throughput ordering did not hold, for the harness reason above, and M4's
+peak allocation does *not* flatten across concurrency (it grows +0.543 GB
+from c=1 to c=32, the same slope as M3's +0.542 GB, while sitting exactly
+3.67 GB higher for the 4000-block pool), because HF's contiguous-`forward()`
+requirement means M4 still materializes M3's padded scratch tensor every
+step — paging's memory win can't be collected until a kernel reads pages
+in place, which is Phase 3's job.
+
 ## Getting started
 
 ```bash
