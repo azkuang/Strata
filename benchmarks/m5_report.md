@@ -8,7 +8,9 @@
 
 The from-scratch engine reaches **83.5% of the M0 vLLM bf16 baseline at concurrency 1**
 (11.37 vs 13.61 tok/s) and **59.2% at concurrency 32** (251.34 vs 424.23 tok/s), with
-M2's static batching as the best-performing variant on this workload. The single biggest
+M2's static batching the best-performing variant at concurrency 8 and 32 on this workload
+(M3 holds a narrow lead at concurrency 1: 11.43 vs M2's 11.37 uniform tok/s, i.e. 84.0% vs
+83.5% of the vLLM baseline). The single biggest
 takeaway is a result that contradicts the naive M2→M3→M4 ordering: on a *closed* prompt
 pool where `max_concurrent_slots == number of requests`, **M3 and M4 are slower than M2**
 (198.42 and 160.45 tok/s at concurrency 32), because continuous batching has no queue to
@@ -26,7 +28,8 @@ which is precisely what Phase 3's kernel work targets.
 - **Workload:** the 8-prompt fixed pool in `strata/benchmark_prompts.py`, cycled to reach
   concurrency 8/32; `--max-new-tokens 128`; greedy (argmax) decoding, no sampling, no
   repetition penalty.
-  - **Measured prompt lengths** (after chat templating, tokenized): 41, 40, 43, 51, 50,
+  - **Measured prompt lengths** (after chat templating, tokenized; from an ad-hoc
+    verification run, not part of the committed grid data): 41, 40, 43, 51, 50,
     43, 46, 53 tokens → **mean 45.9, min 40, max 53**. At concurrency 8 and 32 the pool
     cycles these same 8 prompts, so M2's left-padded batch is 53 tokens wide in every case.
   - **Measured mean output length per sequence** (derived from each row's `total_tokens`,
@@ -65,12 +68,17 @@ which is precisely what Phase 3's kernel work targets.
   them as trend indicators, not 3-significant-figure measurements.
 - **One measurement artifact, investigated and confirmed benign:** M2 produced slightly
   more total decode tokens than M3/M4 at the same concurrency (758 vs 742 at c=8;
-  3004 vs 2936 at c=32). This is *not* a correctness bug. A direct comparison run showed
-  4 of 8 sequences token-for-token identical between M2 and M3, with the other 4 diverging
-  only at decode indices 64, 75, 84 and 100 — i.e. deep into generation, where the tiny
-  floating-point differences between a padded 8-wide batched matmul and a per-sequence one
-  eventually flip an argmax and shift EOS timing by a few tokens. `uniform_tok_per_s`
-  divides by each run's own token count, so this does not bias the throughput comparison.
+  3004 vs 2936 at c=32). This is *not* a correctness bug. A direct comparison run (an
+  ad-hoc verification run, not part of the committed grid data) showed 4 of 8 sequences
+  token-for-token identical between M2 and M3, with the other 4 diverging only at decode
+  indices 64, 75, 84 and 100 — i.e. deep into generation, where the tiny floating-point
+  differences between a padded 8-wide batched matmul and a per-sequence one eventually
+  flip an argmax and shift EOS timing by a few tokens. Because `uniform_tok_per_s =
+  total_tokens / duration_s` puts the token count in the numerator, this inflates M2's
+  `uniform_tok_per_s` by about 2.3% at concurrency 32 relative to M3 at an identical 127
+  global steps (3004 vs 2936 tokens: `3004/2936 = 1.0232`); the per-step inter-token-latency
+  comparison in the Throughput & Latency table is the step-count-normalized version of this
+  comparison and is unaffected by the token-count difference.
 
 ## Throughput & Latency
 
@@ -117,7 +125,7 @@ the initial admission loop and nothing ever waits for a slot. Continuous batchin
 value proposition — evict a finished sequence and immediately admit a waiting one instead
 of letting the batch drain — is unexercised. What remains is only the residual benefit of
 shrinking the active batch as sequences finish, which is real but small here (the workload's
-finish times are tightly clustered: M2's batch still ran the full 127 decode steps at both
+finish times are tightly clustered: M2's batch still ran the full 127 global steps at both
 c=8 and c=32, and mean output length is ~93 of a 128 budget), against the full cost of
 M3's per-step repack. The cost wins.
 
@@ -202,12 +210,12 @@ padding-to-longest in the persistent store, no reserve-for-worst-case) but canno
 *collected* until a kernel reads pages in place. That is a direct, measured argument for
 Phase 3.
 
-A second observation on sizing: with mean sequence length ~139 tokens, 32 concurrent
-sequences need under ~400 of the 4000 blocks — **under 10% pool utilization**. The
-"unconstrained" configuration this grid uses is therefore over-provisioned by roughly 10x,
-which costs 3.3 GB of the 3.67 GB pool for nothing. In a real deployment the pool would be
-sized to the memory actually available after weights, which is exactly the regime where
-block pressure and preemption start to matter (see below).
+A second observation on sizing: with mean sequence length ~139 tokens (prompt + generated),
+32 concurrent sequences need `ceil(139/16) × 32 = 288` of the 4000 blocks — **7.2% pool
+utilization**. The "unconstrained" configuration this grid uses is therefore substantially
+over-provisioned, leaving roughly 3.41 GB of the 3.67 GB pool idle. In a real deployment the
+pool would be sized to the memory actually available after weights, which is exactly the
+regime where block pressure and preemption start to matter (see below).
 
 ## Efficiency (tokens/sec/watt)
 
@@ -342,7 +350,7 @@ output of 92.75 tokens, roughly **27% of every reservation would go unused**, an
 for a workload with a long tail. Option (b) trades a bounded, *measured* recompute cost
 (+19.7% steps in the observed case) for the ability to run a pool sized to real demand
 rather than worst-case demand. M4 chose (b), and the fact that this grid's 4000-block pool
-sat at under 10% utilization while a 14-block pool triggered preemption within 25 steps
+sat at ~7.2% utilization while a 14-block pool triggered preemption within 25 steps
 shows how narrow the window between "wasteful" and "under pressure" actually is — which is
 the whole reason the allocator has to handle the pressure case gracefully rather than
 assuming it away.
